@@ -13,19 +13,47 @@ LABEL_TO_ID = {
     "c": 2,
 }
 
+HF_DOWNLOAD_SPECS = {
+    "mnli_train": [("nyu-mll/multi_nli", None, "train", "mnli_train")],
+    "mnli_validation_matched": [("nyu-mll/multi_nli", None, "validation_matched", "mnli_validation_matched")],
+    "mnli_validation_mismatched": [("nyu-mll/multi_nli", None, "validation_mismatched", "mnli_validation_mismatched")],
+    "snli_train": [("stanfordnlp/snli", None, "train", "snli_train")],
+    "snli_validation": [("stanfordnlp/snli", None, "validation", "snli_validation")],
+    "snli_test": [("stanfordnlp/snli", None, "test", "snli_test")],
+    "anli_train": [
+        ("facebook/anli", None, "train_r1", "anli_train_r1"),
+        ("facebook/anli", None, "train_r2", "anli_train_r2"),
+        ("facebook/anli", None, "train_r3", "anli_train_r3"),
+    ],
+    "anli_train_r1": [("facebook/anli", None, "train_r1", "anli_train_r1")],
+    "anli_train_r2": [("facebook/anli", None, "train_r2", "anli_train_r2")],
+    "anli_train_r3": [("facebook/anli", None, "train_r3", "anli_train_r3")],
+    "anli_dev_r1": [("facebook/anli", None, "dev_r1", "anli_dev_r1")],
+    "anli_dev_r2": [("facebook/anli", None, "dev_r2", "anli_dev_r2")],
+    "anli_dev_r3": [("facebook/anli", None, "dev_r3", "anli_dev_r3")],
+    "anli_test_r1": [("facebook/anli", None, "test_r1", "anli_test_r1")],
+    "anli_test_r2": [("facebook/anli", None, "test_r2", "anli_test_r2")],
+    "anli_test_r3": [("facebook/anli", None, "test_r3", "anli_test_r3")],
+}
+
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Normalize local English NLI files into data/processed JSONL.")
+    parser = argparse.ArgumentParser(
+        description="Normalize local English NLI files into data/processed JSONL. "
+        "If a raw file is missing, known splits can be downloaded automatically from Hugging Face."
+    )
     parser.add_argument(
         "--spec",
         action="append",
         default=[],
         help=(
             "Mapping in the form split_name=path/to/raw.jsonl. "
-            "Repeat this argument for each split you want to create."
+            "If the file is missing and split_name is known, the script will try to download it."
         ),
     )
     parser.add_argument("--output-dir", default="data/processed")
+    parser.add_argument("--raw-dir", default="data/raw")
+    parser.add_argument("--no-download-missing", action="store_true")
     return parser.parse_args()
 
 
@@ -131,20 +159,85 @@ def write_jsonl(path, rows):
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def load_dataset_module():
+    try:
+        from datasets import load_dataset
+    except ImportError as error:
+        raise RuntimeError(
+            "Automatic download requires the 'datasets' package. "
+            "Install it first with `pip install datasets` or provide local raw files."
+        ) from error
+    return load_dataset
+
+
+def download_rows_for_split(split_name, raw_path):
+    download_specs = HF_DOWNLOAD_SPECS.get(split_name)
+    if not download_specs:
+        raise FileNotFoundError(
+            f"Raw data file not found: {raw_path}. "
+            f"Split '{split_name}' is not in the automatic download map."
+        )
+
+    load_dataset = load_dataset_module()
+    downloaded_rows = []
+    for dataset_name, subset_name, dataset_split, source_name in download_specs:
+        kwargs = {"path": dataset_name, "split": dataset_split}
+        if subset_name is not None:
+            kwargs["name"] = subset_name
+        dataset = load_dataset(**kwargs)
+        for row in dataset:
+            downloaded_rows.append(
+                {
+                    "premise": row.get("premise"),
+                    "hypothesis": row.get("hypothesis"),
+                    "label": row.get("label"),
+                    "source": source_name,
+                }
+            )
+    return downloaded_rows
+
+
+def load_or_download_rows(split_name, raw_path, allow_download):
+    raw_path = Path(raw_path)
+    if raw_path.exists():
+        return read_rows(raw_path), "local"
+
+    if not allow_download:
+        raise FileNotFoundError(f"Raw data file not found: {raw_path}")
+
+    rows = download_rows_for_split(split_name, raw_path)
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    write_jsonl(raw_path, rows)
+    return rows, "downloaded"
+
+
+def default_specs(raw_dir):
+    raw_dir = Path(raw_dir)
+    return [
+        f"mnli_train={raw_dir / 'mnli_train.jsonl'}",
+        f"mnli_validation_mismatched={raw_dir / 'mnli_validation_mismatched.jsonl'}",
+        f"snli_train={raw_dir / 'snli_train.jsonl'}",
+        f"snli_validation={raw_dir / 'snli_validation.jsonl'}",
+        f"snli_test={raw_dir / 'snli_test.jsonl'}",
+        f"anli_train={raw_dir / 'anli_train.jsonl'}",
+    ]
+
+
 def main():
     args = parse_args()
     if not args.spec:
-        raise ValueError(
-            "No input specs provided. Example: "
-            "--spec mnli_train=data/raw/mnli_train.jsonl --spec anli_train=data/raw/anli_train.jsonl"
-        )
+        args.spec = default_specs(args.raw_dir)
 
     output_dir = Path(args.output_dir)
     manifest = {}
 
     for item in args.spec:
         split_name, raw_path = parse_spec(item)
-        rows = read_rows(raw_path)
+        rows, source_kind = load_or_download_rows(
+            split_name=split_name,
+            raw_path=raw_path,
+            allow_download=not args.no_download_missing,
+        )
         normalized = []
         seen = set()
 
@@ -162,11 +255,12 @@ def main():
         output_path = output_dir / f"{split_name}.jsonl"
         write_jsonl(output_path, normalized)
         manifest[split_name] = {
-            "raw_path": raw_path,
+            "raw_path": str(raw_path),
+            "raw_source": source_kind,
             "output_path": str(output_path),
             "num_examples": len(normalized),
         }
-        print(f"{split_name}: wrote {len(normalized):,} examples to {output_path}")
+        print(f"{split_name}: wrote {len(normalized):,} examples to {output_path} ({source_kind})")
 
     manifest_path = output_dir / "manifest.json"
     with manifest_path.open("w", encoding="utf-8") as handle:
