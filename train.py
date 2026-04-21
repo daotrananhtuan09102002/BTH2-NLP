@@ -18,8 +18,12 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import BertForMaskedLM, PreTrainedTokenizerFast, get_linear_schedule_with_warmup
 
 from model import (
+    DEFAULT_CLS_TOKEN_ID,
     DEFAULT_MAX_LENGTH,
+    DEFAULT_MASK_TOKEN_ID,
+    DEFAULT_PAD_TOKEN_ID,
     DEFAULT_SEP_TOKEN_ID,
+    DEFAULT_UNK_TOKEN_ID,
     MAX_PARAMETER_BUDGET,
     NLI,
     NLIConfig,
