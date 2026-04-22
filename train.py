@@ -780,6 +780,29 @@ def build_data_loader(dataset, batch_size, shuffle, collate, args, generator=Non
     )
 
 
+def load_encoder_state(target_bert, pretrained_encoder_state):
+    load_result = target_bert.load_state_dict(
+        pretrained_encoder_state, strict=False)
+    missing = list(load_result.missing_keys)
+    unexpected = list(load_result.unexpected_keys)
+
+    non_pooler_missing = [
+        key for key in missing if not key.startswith("pooler.")
+    ]
+    if non_pooler_missing:
+        raise RuntimeError(
+            "Encoder state dict mismatch beyond pooler keys. "
+            f"Missing keys: {non_pooler_missing}. Unexpected keys: {unexpected}."
+        )
+
+    if missing or unexpected:
+        print(
+            "[Init] Loaded encoder with relaxed matching. "
+            f"missing_keys={missing} unexpected_keys={unexpected}",
+            flush=True,
+        )
+
+
 def main():
     args = parse_args()
     set_seed(args.seed)
@@ -862,7 +885,7 @@ def main():
     )
 
     holdout_model = NLI(model_config)
-    holdout_model.bert.load_state_dict(pretrained_encoder_state, strict=True)
+    load_encoder_state(holdout_model.bert, pretrained_encoder_state)
     holdout_result = run_supervised_training(
         model=holdout_model,
         train_loader=train_loader,
@@ -897,7 +920,7 @@ def main():
     )
 
     final_model = NLI(model_config)
-    final_model.bert.load_state_dict(pretrained_encoder_state, strict=True)
+    load_encoder_state(final_model.bert, pretrained_encoder_state)
     final_result = run_supervised_training(
         model=final_model,
         train_loader=final_train_loader,
