@@ -627,6 +627,7 @@ def run_supervised_training(
     save_prefix=None,
 ):
     maybe_enable_gradient_checkpointing(model, args.gradient_checkpointing)
+    model.to(device)
     optimizer = build_optimizer(
         model, lr=args.nli_lr, weight_decay=args.weight_decay)
 
@@ -645,7 +646,6 @@ def run_supervised_training(
     amp_dtype, scaler = create_amp_components(device)
     ema = ExponentialMovingAverage(model, decay=args.ema_decay)
 
-    model.to(device)
     global_step = 0
     best_step = 0
     best_metrics = None
