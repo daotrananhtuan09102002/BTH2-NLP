@@ -236,6 +236,10 @@ class NLI(PreTrainedModel):
                 pad_token_id=self.config.pad_token_id,
             )
 
+        # Newer Trainer versions may pass bookkeeping kwargs (e.g. num_items_in_batch)
+        # that are not valid AlbertModel.forward arguments.
+        kwargs.pop("num_items_in_batch", None)
+
         outputs = self.albert(
             input_ids=input_ids,
             attention_mask=attention_mask,
