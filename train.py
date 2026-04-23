@@ -476,7 +476,10 @@ def evaluate_nli(model, dataloader, device):
         for batch in dataloader:
             batch = move_batch_to_device(batch, device)
             outputs = model(**batch)
-            total_loss += float(outputs.loss.item())
+            loss = outputs.loss
+            if isinstance(loss, torch.Tensor) and loss.dim() > 0:
+                loss = loss.mean()
+            total_loss += float(loss.item())
             total_batches += 1
             predictions.extend(outputs.logits.argmax(dim=-1).cpu().tolist())
             labels.extend(batch["labels"].cpu().tolist())
@@ -565,7 +568,10 @@ def run_mlm_pretraining(model, dataloader, args, device):
             batch = move_batch_to_device(batch, device)
             with get_autocast_context(device, amp_dtype):
                 outputs = model(**batch)
-                loss = outputs.loss / args.mlm_grad_accum
+                loss = outputs.loss
+                if isinstance(loss, torch.Tensor) and loss.dim() > 0:
+                    loss = loss.mean()
+                loss = loss / args.mlm_grad_accum
 
             if scaler is not None:
                 scaler.scale(loss).backward()
@@ -676,7 +682,10 @@ def run_supervised_training(
             batch = move_batch_to_device(batch, device)
             with get_autocast_context(device, amp_dtype):
                 outputs = model(**batch)
-                loss = outputs.loss / args.nli_grad_accum
+                loss = outputs.loss
+                if isinstance(loss, torch.Tensor) and loss.dim() > 0:
+                    loss = loss.mean()
+                loss = loss / args.nli_grad_accum
 
             if scaler is not None:
                 scaler.scale(loss).backward()
