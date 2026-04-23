@@ -72,6 +72,7 @@ def parse_args():
                         action="store_false", dest="gradient_checkpointing")
     parser.add_argument("--save-every-epoch", action="store_true")
     parser.add_argument("--log-interval", type=int, default=100)
+    parser.add_argument("--multi-gpu", action="store_true")
 
     parser.add_argument("--vocab-size", type=int, default=26_000)
     parser.add_argument("--max-length", type=int, default=DEFAULT_MAX_LENGTH)
@@ -517,10 +518,18 @@ def count_update_steps(num_batches, grad_accum, epochs):
 def maybe_enable_gradient_checkpointing(model, enabled):
     if not enabled:
         return
+    if isinstance(model, torch.nn.DataParallel):
+        model = model.module
     if hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
     elif hasattr(model, "bert") and hasattr(model.bert, "gradient_checkpointing_enable"):
         model.bert.gradient_checkpointing_enable()
+
+
+def unwrap_model(model):
+    if isinstance(model, torch.nn.DataParallel):
+        return model.module
+    return model
 
 
 def run_mlm_pretraining(model, dataloader, args, device):
@@ -734,7 +743,7 @@ def run_supervised_training(
             snapshot_dir.mkdir(parents=True, exist_ok=True)
             ema.apply_shadow(model)
             try:
-                model.save_pretrained(snapshot_dir)
+                unwrap_model(model).save_pretrained(snapshot_dir)
             finally:
                 ema.restore(model)
 
@@ -827,6 +836,15 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training device: {device}")
+    gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    use_data_parallel = args.multi_gpu and gpu_count > 1
+    print(f"Visible CUDA devices: {gpu_count}")
+    if args.multi_gpu and gpu_count <= 1:
+        print(
+            "[MultiGPU] --multi-gpu was set but only one CUDA device is available.", flush=True)
+    if use_data_parallel:
+        print(
+            f"[MultiGPU] DataParallel enabled across {gpu_count} GPUs.", flush=True)
 
     mlm_dataset = PairTextDataset(full_examples)
     mlm_loader = build_data_loader(
@@ -847,10 +865,12 @@ def main():
     )
 
     mlm_model = BertForMaskedLM(model_config.to_bert_config())
+    if use_data_parallel:
+        mlm_model = torch.nn.DataParallel(mlm_model)
     mlm_model = run_mlm_pretraining(mlm_model, mlm_loader, args, device)
     pretrained_encoder_state = {
         name: tensor.detach().cpu().clone()
-        for name, tensor in mlm_model.bert.state_dict().items()
+        for name, tensor in unwrap_model(mlm_model).bert.state_dict().items()
     }
     del mlm_model
     if torch.cuda.is_available():
@@ -885,7 +905,10 @@ def main():
     )
 
     holdout_model = NLI(model_config)
-    load_encoder_state(holdout_model.bert, pretrained_encoder_state)
+    if use_data_parallel:
+        holdout_model = torch.nn.DataParallel(holdout_model)
+    load_encoder_state(unwrap_model(holdout_model).bert,
+                       pretrained_encoder_state)
     holdout_result = run_supervised_training(
         model=holdout_model,
         train_loader=train_loader,
@@ -920,7 +943,10 @@ def main():
     )
 
     final_model = NLI(model_config)
-    load_encoder_state(final_model.bert, pretrained_encoder_state)
+    if use_data_parallel:
+        final_model = torch.nn.DataParallel(final_model)
+    load_encoder_state(unwrap_model(final_model).bert,
+                       pretrained_encoder_state)
     final_result = run_supervised_training(
         model=final_model,
         train_loader=final_train_loader,
@@ -933,7 +959,7 @@ def main():
 
     final_result["ema"].apply_shadow(final_model)
     try:
-        final_model.save_pretrained(args.model_dir)
+        unwrap_model(final_model).save_pretrained(args.model_dir)
     finally:
         final_result["ema"].restore(final_model)
 
