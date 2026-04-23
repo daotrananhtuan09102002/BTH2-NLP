@@ -1,39 +1,22 @@
 import argparse
-import copy
 import json
 import math
 import random
 from collections import Counter
-from contextlib import nullcontext
 from pathlib import Path
 
 import torch
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from sklearn.model_selection import StratifiedShuffleSplit
-from tokenizers import Tokenizer, normalizers, processors
-from tokenizers.models import WordPiece
-from tokenizers.pre_tokenizers import BertPreTokenizer
-from tokenizers.trainers import WordPieceTrainer
 from torch.utils.data import DataLoader, Dataset
-from transformers import BertForMaskedLM, PreTrainedTokenizerFast, get_linear_schedule_with_warmup
-
-from model import (
-    DEFAULT_CLS_TOKEN_ID,
-    DEFAULT_MAX_LENGTH,
-    DEFAULT_MASK_TOKEN_ID,
-    DEFAULT_PAD_TOKEN_ID,
-    DEFAULT_SEP_TOKEN_ID,
-    DEFAULT_UNK_TOKEN_ID,
-    MAX_PARAMETER_BUDGET,
-    NLI,
-    NLIConfig,
-    collate_fn,
-    estimated_parameter_count,
-    tokenizes,
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    get_linear_schedule_with_warmup,
 )
 
 
-ARTIFACT_VERSION = "nli_bert_wordpiece_v2"
+ARTIFACT_VERSION = "nli_albert_large_v2_ft_v1"
 LABEL_TO_ID = {
     "entailment": 0,
     "neutral": 1,
@@ -55,47 +38,28 @@ DEFAULT_HOLDOUT_FILE = "data/processed/dev.jsonl"
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train a near-40M English NLI model offline.")
-    parser.add_argument("--train-files", nargs="+",
-                        default=DEFAULT_TRAIN_FILES)
+        description="Fine-tune albert-large-v2 for English NLI."
+    )
+    parser.add_argument("--train-files", nargs="+", default=DEFAULT_TRAIN_FILES)
+    parser.add_argument("--model-name", default="albert-large-v2")
     parser.add_argument("--model-dir", default="MODEL")
     parser.add_argument("--holdout-output", default=DEFAULT_HOLDOUT_FILE)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--holdout-ratio", type=float, default=0.015)
     parser.add_argument("--warmup-ratio", type=float, default=0.06)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--gradient-checkpointing",
-                        action="store_true", default=True)
-    parser.add_argument("--disable-gradient-checkpointing",
-                        action="store_false", dest="gradient_checkpointing")
     parser.add_argument("--save-every-epoch", action="store_true")
     parser.add_argument("--log-interval", type=int, default=100)
     parser.add_argument("--multi-gpu", action="store_true")
 
-    parser.add_argument("--vocab-size", type=int, default=26_000)
-    parser.add_argument("--max-length", type=int, default=DEFAULT_MAX_LENGTH)
-    parser.add_argument("--hidden-size", type=int, default=512)
-    parser.add_argument("--num-hidden-layers", type=int, default=8)
-    parser.add_argument("--num-attention-heads", type=int, default=8)
-    parser.add_argument("--intermediate-size", type=int, default=2048)
-    parser.add_argument("--classifier-hidden-size", type=int, default=1024)
-    parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--label-smoothing", type=float, default=0.05)
-    parser.add_argument("--ema-decay", type=float, default=0.999)
-
-    parser.add_argument("--mlm-epochs", type=int, default=1)
-    parser.add_argument("--mlm-batch-size", type=int, default=8)
-    parser.add_argument("--mlm-grad-accum", type=int, default=16)
-    parser.add_argument("--mlm-lr", type=float, default=5e-4)
-    parser.add_argument("--mlm-probability", type=float, default=0.15)
-
-    parser.add_argument("--nli-epochs", type=int, default=4)
-    parser.add_argument("--nli-batch-size", type=int, default=8)
-    parser.add_argument("--nli-grad-accum", type=int, default=8)
-    parser.add_argument("--nli-lr", type=float, default=2e-4)
-    parser.add_argument("--anli-oversample", type=int, default=3)
+    parser.add_argument("--max-length", type=int, default=128)
+    parser.add_argument("--nli-epochs", type=int, default=2)
+    parser.add_argument("--nli-batch-size", type=int, default=16)
+    parser.add_argument("--nli-grad-accum", type=int, default=1)
+    parser.add_argument("--nli-lr", type=float, default=2e-5)
+    parser.add_argument("--anli-oversample", type=int, default=1)
     return parser.parse_args()
 
 
@@ -123,8 +87,7 @@ def read_jsonl(path):
             try:
                 rows.append(json.loads(line))
             except json.JSONDecodeError as error:
-                raise ValueError(
-                    f"Invalid JSON on line {line_number} of {path}.") from error
+                raise ValueError(f"Invalid JSON on line {line_number} of {path}.") from error
     return rows
 
 
@@ -202,8 +165,7 @@ def load_examples(paths):
             if example is None:
                 continue
 
-            dedupe_key = (example["premise"],
-                          example["hypothesis"], example["label"])
+            dedupe_key = (example["premise"], example["hypothesis"], example["label"])
             if dedupe_key in seen:
                 continue
             seen.add(dedupe_key)
@@ -212,8 +174,7 @@ def load_examples(paths):
     if not all_examples:
         raise FileNotFoundError(
             "No usable JSONL training examples were found. "
-            f"Checked: {', '.join(paths)}. "
-            "Prepare local data first with prepare_data.py or pass --train-files explicitly."
+            f"Checked: {', '.join(paths)}."
         )
 
     return all_examples, used_files
@@ -221,98 +182,22 @@ def load_examples(paths):
 
 def build_holdout_split(examples, holdout_ratio, seed):
     labels = [example["label"] for example in examples]
-    splitter = StratifiedShuffleSplit(
-        n_splits=1, test_size=holdout_ratio, random_state=seed)
+    splitter = StratifiedShuffleSplit(n_splits=1, test_size=holdout_ratio, random_state=seed)
     train_indices, holdout_indices = next(splitter.split(examples, labels))
     train_examples = [examples[index] for index in train_indices]
     holdout_examples = [examples[index] for index in holdout_indices]
     return train_examples, holdout_examples
 
 
-def yield_training_text(examples):
+def oversample_examples(examples, factor):
+    if factor <= 1:
+        return list(examples)
+
+    expanded = []
     for example in examples:
-        yield example["premise"]
-        yield example["hypothesis"]
-
-
-def build_tokenizer(examples, args):
-    tokenizer = Tokenizer(WordPiece(unk_token="[UNK]"))
-    tokenizer.normalizer = normalizers.BertNormalizer(lowercase=True)
-    tokenizer.pre_tokenizer = BertPreTokenizer()
-    tokenizer.post_processor = processors.TemplateProcessing(
-        single="[CLS] $A [SEP]",
-        pair="[CLS] $A [SEP] $B:1 [SEP]:1",
-        special_tokens=[
-            ("[CLS]", DEFAULT_CLS_TOKEN_ID),
-            ("[SEP]", DEFAULT_SEP_TOKEN_ID),
-        ],
-    )
-
-    trainer = WordPieceTrainer(
-        vocab_size=args.vocab_size,
-        special_tokens=["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"],
-        min_frequency=2,
-    )
-    tokenizer.train_from_iterator(
-        yield_training_text(examples), trainer=trainer)
-
-    hf_tokenizer = PreTrainedTokenizerFast(
-        tokenizer_object=tokenizer,
-        unk_token="[UNK]",
-        pad_token="[PAD]",
-        cls_token="[CLS]",
-        sep_token="[SEP]",
-        mask_token="[MASK]",
-        model_max_length=args.max_length,
-        clean_up_tokenization_spaces=False,
-    )
-    hf_tokenizer.padding_side = "right"
-    hf_tokenizer.truncation_side = "right"
-    return hf_tokenizer
-
-
-def build_model_config(tokenizer, args, label_smoothing):
-    config = NLIConfig(
-        vocab_size=len(tokenizer),
-        hidden_size=args.hidden_size,
-        nclass=3,
-        num_hidden_layers=args.num_hidden_layers,
-        num_attention_heads=args.num_attention_heads,
-        intermediate_size=args.intermediate_size,
-        hidden_dropout_prob=args.dropout,
-        attention_probs_dropout_prob=args.dropout,
-        max_position_embeddings=args.max_length,
-        type_vocab_size=2,
-        pad_token_id=tokenizer.pad_token_id,
-        unk_token_id=tokenizer.unk_token_id,
-        cls_token_id=tokenizer.cls_token_id,
-        sep_token_id=tokenizer.sep_token_id,
-        mask_token_id=tokenizer.mask_token_id,
-        classifier_hidden_size=args.classifier_hidden_size,
-        classifier_dropout=args.dropout,
-        label_smoothing=label_smoothing,
-    )
-    estimated_params = estimated_parameter_count(config)
-    if estimated_params >= MAX_PARAMETER_BUDGET:
-        raise ValueError(
-            f"Configured model exceeds the 40M parameter budget: {estimated_params:,}."
-        )
-    return config
-
-
-class PairTextDataset(Dataset):
-    def __init__(self, examples):
-        self.examples = examples
-
-    def __len__(self):
-        return len(self.examples)
-
-    def __getitem__(self, index):
-        example = self.examples[index]
-        return {
-            "premise": example["premise"],
-            "hypothesis": example["hypothesis"],
-        }
+        repeats = factor if "anli" in example["source"] else 1
+        expanded.extend(example.copy() for _ in range(repeats))
+    return expanded
 
 
 class NLIDataset(Dataset):
@@ -326,115 +211,31 @@ class NLIDataset(Dataset):
 
     def __getitem__(self, index):
         example = self.examples[index]
-        encoded = tokenizes(
-            (example["premise"], example["hypothesis"]),
-            tokenizer=self.tokenizer,
-            max_length=self.max_length,
-        )
-        return {
-            "input_ids": encoded["input_ids"],
-            "labels": example["label"],
-            "pad_token_id": self.tokenizer.pad_token_id,
-            "sep_token_id": self.tokenizer.sep_token_id,
-        }
-
-
-class MLMCollator:
-    def __init__(self, tokenizer, max_length, mlm_probability):
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.mlm_probability = mlm_probability
-
-    def __call__(self, batch):
-        premises = [item["premise"] for item in batch]
-        hypotheses = [item["hypothesis"] for item in batch]
         encoded = self.tokenizer(
-            premises,
-            text_pair=hypotheses,
+            example["premise"],
+            text_pair=example["hypothesis"],
             truncation="longest_first",
             max_length=self.max_length,
             padding="max_length",
-            return_special_tokens_mask=True,
             return_tensors="pt",
         )
-
-        input_ids = encoded["input_ids"]
-        labels = input_ids.clone()
-        probability_matrix = torch.full(
-            labels.shape, self.mlm_probability, dtype=torch.float)
-        special_tokens_mask = encoded.pop("special_tokens_mask").bool()
-        probability_matrix.masked_fill_(special_tokens_mask, 0.0)
-        probability_matrix.masked_fill_(
-            input_ids.eq(self.tokenizer.pad_token_id), 0.0)
-
-        masked_indices = torch.bernoulli(probability_matrix).bool()
-        labels[~masked_indices] = -100
-
-        indices_replaced = (
-            torch.bernoulli(torch.full(
-                labels.shape, 0.8, dtype=torch.float)).bool()
-            & masked_indices
-        )
-        input_ids[indices_replaced] = self.tokenizer.mask_token_id
-
-        indices_random = (
-            torch.bernoulli(torch.full(
-                labels.shape, 0.5, dtype=torch.float)).bool()
-            & masked_indices
-            & ~indices_replaced
-        )
-        random_words = torch.randint(
-            len(self.tokenizer), labels.shape, dtype=torch.long)
-        input_ids[indices_random] = random_words[indices_random]
-
-        encoded["input_ids"] = input_ids
-        encoded["labels"] = labels
-        return encoded
+        return {
+            "input_ids": encoded["input_ids"].squeeze(0),
+            "attention_mask": encoded["attention_mask"].squeeze(0),
+            "token_type_ids": encoded.get("token_type_ids", torch.zeros(self.max_length, dtype=torch.long)).squeeze(0)
+            if encoded.get("token_type_ids") is not None
+            else torch.zeros(self.max_length, dtype=torch.long),
+            "labels": torch.tensor(example["label"], dtype=torch.long),
+        }
 
 
-class ExponentialMovingAverage:
-    def __init__(self, model, decay):
-        self.decay = decay
-        self.shadow = {}
-        self.backup = {}
-        for name, parameter in model.named_parameters():
-            if parameter.requires_grad:
-                self.shadow[name] = parameter.detach().clone()
-
-    @torch.no_grad()
-    def update(self, model):
-        for name, parameter in model.named_parameters():
-            if not parameter.requires_grad:
-                continue
-            self.shadow[name].mul_(self.decay).add_(
-                parameter.detach(), alpha=1.0 - self.decay)
-
-    def apply_shadow(self, model):
-        self.backup = {}
-        for name, parameter in model.named_parameters():
-            if not parameter.requires_grad:
-                continue
-            self.backup[name] = parameter.detach().clone()
-            parameter.data.copy_(self.shadow[name])
-
-    def restore(self, model):
-        for name, parameter in model.named_parameters():
-            if not parameter.requires_grad:
-                continue
-            parameter.data.copy_(self.backup[name])
-        self.backup = {}
-
-
-def create_amp_components(device, prefer_bf16=True):
-    if device.type != "cuda":
-        return None, None
-
-    use_bf16 = prefer_bf16 and torch.cuda.is_bf16_supported()
-    if use_bf16:
-        return torch.bfloat16, None
-
-    scaler = torch.cuda.amp.GradScaler()
-    return torch.float16, scaler
+def collate_nli(batch):
+    return {
+        "input_ids": torch.stack([item["input_ids"] for item in batch], dim=0),
+        "attention_mask": torch.stack([item["attention_mask"] for item in batch], dim=0),
+        "token_type_ids": torch.stack([item["token_type_ids"] for item in batch], dim=0),
+        "labels": torch.stack([item["labels"] for item in batch], dim=0),
+    }
 
 
 def move_batch_to_device(batch, device):
@@ -442,12 +243,6 @@ def move_batch_to_device(batch, device):
         key: value.to(device) if isinstance(value, torch.Tensor) else value
         for key, value in batch.items()
     }
-
-
-def get_autocast_context(device, amp_dtype):
-    if device.type != "cuda" or amp_dtype is None:
-        return nullcontext()
-    return torch.autocast(device_type="cuda", dtype=amp_dtype)
 
 
 def compute_metrics(predictions, labels):
@@ -463,6 +258,12 @@ def compute_metrics(predictions, labels):
         "macro_recall": macro_recall,
         "macro_f1": macro_f1,
     }
+
+
+def unwrap_model(model):
+    if isinstance(model, torch.nn.DataParallel):
+        return model.module
+    return model
 
 
 def evaluate_nli(model, dataloader, device):
@@ -481,8 +282,9 @@ def evaluate_nli(model, dataloader, device):
                 loss = loss.mean()
             total_loss += float(loss.item())
             total_batches += 1
-            predictions.extend(outputs.logits.argmax(dim=-1).cpu().tolist())
-            labels.extend(batch["labels"].cpu().tolist())
+            logits = outputs.logits
+            predictions.extend(logits.argmax(dim=-1).detach().cpu().tolist())
+            labels.extend(batch["labels"].detach().cpu().tolist())
 
     metrics = compute_metrics(predictions, labels)
     metrics["loss"] = total_loss / max(total_batches, 1)
@@ -518,148 +320,17 @@ def count_update_steps(num_batches, grad_accum, epochs):
     return max(steps_per_epoch * epochs, 1)
 
 
-def maybe_enable_gradient_checkpointing(model, enabled):
-    if not enabled:
-        return
-    if isinstance(model, torch.nn.DataParallel):
-        model = model.module
-    if hasattr(model, "gradient_checkpointing_enable"):
-        model.gradient_checkpointing_enable()
-    elif hasattr(model, "bert") and hasattr(model.bert, "gradient_checkpointing_enable"):
-        model.bert.gradient_checkpointing_enable()
+def run_supervised_training(model, train_loader, eval_loader, args, device):
+    model.to(device)
+    optimizer = build_optimizer(model, lr=args.nli_lr, weight_decay=args.weight_decay)
 
-
-def unwrap_model(model):
-    if isinstance(model, torch.nn.DataParallel):
-        return model.module
-    return model
-
-
-def run_mlm_pretraining(model, dataloader, args, device):
-    maybe_enable_gradient_checkpointing(model, args.gradient_checkpointing)
-    optimizer = build_optimizer(
-        model, lr=args.mlm_lr, weight_decay=args.weight_decay)
-    num_batches = len(dataloader)
-    total_steps = count_update_steps(
-        num_batches, args.mlm_grad_accum, args.mlm_epochs)
+    total_steps = count_update_steps(len(train_loader), args.nli_grad_accum, args.nli_epochs)
     warmup_steps = max(int(total_steps * args.warmup_ratio), 1)
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=warmup_steps,
         num_training_steps=total_steps,
     )
-    amp_dtype, scaler = create_amp_components(device)
-
-    model.to(device)
-    model.train()
-    global_step = 0
-    log_interval = max(int(args.log_interval), 1)
-    optimizer.zero_grad(set_to_none=True)
-    print(
-        "[MLM] start "
-        f"epochs={args.mlm_epochs} batches_per_epoch={num_batches} "
-        f"grad_accum={args.mlm_grad_accum} total_update_steps={total_steps}",
-        flush=True,
-    )
-
-    for epoch in range(args.mlm_epochs):
-        running_loss = 0.0
-        for batch_index, batch in enumerate(dataloader, start=1):
-            batch = move_batch_to_device(batch, device)
-            with get_autocast_context(device, amp_dtype):
-                outputs = model(**batch)
-                loss = outputs.loss
-                if isinstance(loss, torch.Tensor) and loss.dim() > 0:
-                    loss = loss.mean()
-                loss = loss / args.mlm_grad_accum
-
-            if scaler is not None:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
-
-            running_loss += float(loss.item()) * args.mlm_grad_accum
-
-            should_step = (
-                batch_index % args.mlm_grad_accum == 0
-                or batch_index == len(dataloader)
-            )
-            if not should_step:
-                continue
-
-            if scaler is not None:
-                scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(), args.max_grad_norm)
-
-            if scaler is not None:
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
-
-            scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
-            global_step += 1
-
-            if global_step % log_interval == 0 or global_step == total_steps:
-                avg_seen_loss = running_loss / max(batch_index, 1)
-                print(
-                    f"[MLM] step={global_step}/{total_steps} "
-                    f"epoch={epoch + 1}/{args.mlm_epochs} "
-                    f"batch={batch_index}/{num_batches} "
-                    f"avg_loss={avg_seen_loss:.4f}",
-                    flush=True,
-                )
-
-        average_loss = running_loss / max(len(dataloader), 1)
-        print(
-            f"[MLM] epoch={epoch + 1}/{args.mlm_epochs} loss={average_loss:.4f} steps={global_step}",
-            flush=True,
-        )
-
-    return model
-
-
-def evaluate_with_ema(model, dataloader, device, ema):
-    if ema is None:
-        return evaluate_nli(model, dataloader, device)
-
-    ema.apply_shadow(model)
-    try:
-        return evaluate_nli(model, dataloader, device)
-    finally:
-        ema.restore(model)
-
-
-def run_supervised_training(
-    model,
-    train_loader,
-    eval_loader,
-    args,
-    device,
-    max_train_steps=None,
-    save_prefix=None,
-):
-    maybe_enable_gradient_checkpointing(model, args.gradient_checkpointing)
-    model.to(device)
-    optimizer = build_optimizer(
-        model, lr=args.nli_lr, weight_decay=args.weight_decay)
-
-    if max_train_steps is None:
-        total_steps = count_update_steps(
-            len(train_loader), args.nli_grad_accum, args.nli_epochs)
-    else:
-        total_steps = max_train_steps
-
-    warmup_steps = max(int(total_steps * args.warmup_ratio), 1)
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=warmup_steps,
-        num_training_steps=total_steps,
-    )
-    amp_dtype, scaler = create_amp_components(device)
-    ema = ExponentialMovingAverage(model, decay=args.ema_decay)
 
     global_step = 0
     best_step = 0
@@ -680,18 +351,13 @@ def run_supervised_training(
 
         for batch_index, batch in enumerate(train_loader, start=1):
             batch = move_batch_to_device(batch, device)
-            with get_autocast_context(device, amp_dtype):
-                outputs = model(**batch)
-                loss = outputs.loss
-                if isinstance(loss, torch.Tensor) and loss.dim() > 0:
-                    loss = loss.mean()
-                loss = loss / args.nli_grad_accum
+            outputs = model(**batch)
+            loss = outputs.loss
+            if isinstance(loss, torch.Tensor) and loss.dim() > 0:
+                loss = loss.mean()
+            loss = loss / args.nli_grad_accum
 
-            if scaler is not None:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
-
+            loss.backward()
             running_loss += float(loss.item()) * args.nli_grad_accum
 
             should_step = (
@@ -701,20 +367,10 @@ def run_supervised_training(
             if not should_step:
                 continue
 
-            if scaler is not None:
-                scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(), args.max_grad_norm)
-
-            if scaler is not None:
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
-
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            optimizer.step()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
-            ema.update(model)
             global_step += 1
 
             if global_step % log_interval == 0 or global_step == total_steps:
@@ -727,37 +383,27 @@ def run_supervised_training(
                     flush=True,
                 )
 
-            if max_train_steps is not None and global_step >= max_train_steps:
-                break
-
         average_train_loss = running_loss / max(len(train_loader), 1)
-        log_message = f"[NLI] epoch={epoch + 1}/{args.nli_epochs} train_loss={average_train_loss:.4f} steps={global_step}"
+        metrics = evaluate_nli(model, eval_loader, device)
+        print(
+            f"[NLI] epoch={epoch + 1}/{args.nli_epochs} "
+            f"train_loss={average_train_loss:.4f} "
+            f"eval_loss={metrics['loss']:.4f} "
+            f"macro_f1={metrics['macro_f1']:.4f} "
+            f"accuracy={metrics['accuracy']:.4f} "
+            f"steps={global_step}",
+            flush=True,
+        )
 
-        if eval_loader is not None:
-            metrics = evaluate_with_ema(model, eval_loader, device, ema)
-            log_message += (
-                f" eval_loss={metrics['loss']:.4f}"
-                f" macro_f1={metrics['macro_f1']:.4f}"
-                f" accuracy={metrics['accuracy']:.4f}"
-            )
-            if best_metrics is None or metrics["macro_f1"] > best_metrics["macro_f1"]:
-                best_metrics = metrics
-                best_step = global_step
+        if best_metrics is None or metrics["macro_f1"] > best_metrics["macro_f1"]:
+            best_metrics = metrics
+            best_step = global_step
+            unwrap_model(model).save_pretrained(args.model_dir)
 
-        print(log_message, flush=True)
-
-        if args.save_every_epoch and save_prefix:
-            snapshot_dir = Path(args.model_dir) / \
-                f"{save_prefix}_epoch_{epoch + 1}"
+        if args.save_every_epoch:
+            snapshot_dir = Path(args.model_dir) / f"epoch_{epoch + 1}"
             snapshot_dir.mkdir(parents=True, exist_ok=True)
-            ema.apply_shadow(model)
-            try:
-                unwrap_model(model).save_pretrained(snapshot_dir)
-            finally:
-                ema.restore(model)
-
-        if max_train_steps is not None and global_step >= max_train_steps:
-            break
+            unwrap_model(model).save_pretrained(snapshot_dir)
 
     if best_step == 0:
         best_step = global_step
@@ -765,60 +411,25 @@ def run_supervised_training(
     return {
         "best_step": best_step,
         "best_metrics": best_metrics,
-        "ema": ema,
     }
 
 
-def oversample_examples(examples, factor):
-    if factor <= 1:
-        return list(examples)
-
-    expanded = []
-    for example in examples:
-        repeats = factor if "anli" in example["source"] else 1
-        expanded.extend(copy.deepcopy(example) for _ in range(repeats))
-    return expanded
-
-
-def save_training_summary(path, summary):
-    ensure_parent_dir(path)
-    with Path(path).open("w", encoding="utf-8") as handle:
-        json.dump(summary, handle, ensure_ascii=False, indent=2)
-
-
-def build_data_loader(dataset, batch_size, shuffle, collate, args, generator=None):
+def build_data_loader(dataset, batch_size, shuffle, args, generator=None):
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
-        collate_fn=collate,
+        collate_fn=collate_nli,
         generator=generator,
     )
 
 
-def load_encoder_state(target_bert, pretrained_encoder_state):
-    load_result = target_bert.load_state_dict(
-        pretrained_encoder_state, strict=False)
-    missing = list(load_result.missing_keys)
-    unexpected = list(load_result.unexpected_keys)
-
-    non_pooler_missing = [
-        key for key in missing if not key.startswith("pooler.")
-    ]
-    if non_pooler_missing:
-        raise RuntimeError(
-            "Encoder state dict mismatch beyond pooler keys. "
-            f"Missing keys: {non_pooler_missing}. Unexpected keys: {unexpected}."
-        )
-
-    if missing or unexpected:
-        print(
-            "[Init] Loaded encoder with relaxed matching. "
-            f"missing_keys={missing} unexpected_keys={unexpected}",
-            flush=True,
-        )
+def save_training_summary(path, summary):
+    ensure_parent_dir(path)
+    with Path(path).open("w", encoding="utf-8") as handle:
+        json.dump(summary, handle, ensure_ascii=False, indent=2)
 
 
 def main():
@@ -833,15 +444,23 @@ def main():
     )
     write_jsonl(args.holdout_output, holdout_examples)
 
-    tokenizer = build_tokenizer(full_examples, args)
+    supervised_train_examples = oversample_examples(train_examples, args.anli_oversample)
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
+    tokenizer.model_max_length = args.max_length
     Path(args.model_dir).mkdir(parents=True, exist_ok=True)
     tokenizer.save_pretrained(args.model_dir)
 
-    model_config = build_model_config(
-        tokenizer, args, label_smoothing=args.label_smoothing)
-    estimated_params = estimated_parameter_count(model_config)
-    print(f"Tokenizer vocab size: {len(tokenizer):,}")
-    print(f"Estimated model parameters: {estimated_params:,}")
+    model = AutoModelForSequenceClassification.from_pretrained(
+        args.model_name,
+        num_labels=3,
+        id2label={0: "entailment", 1: "neutral", 2: "contradiction"},
+        label2id={"entailment": 0, "neutral": 1, "contradiction": 2},
+    )
+
+    estimated_params = sum(parameter.numel() for parameter in model.parameters())
+    print(f"Pretrained model: {args.model_name}")
+    print(f"Model parameters: {estimated_params:,}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training device: {device}")
@@ -849,53 +468,18 @@ def main():
     use_data_parallel = args.multi_gpu and gpu_count > 1
     print(f"Visible CUDA devices: {gpu_count}")
     if args.multi_gpu and gpu_count <= 1:
-        print(
-            "[MultiGPU] --multi-gpu was set but only one CUDA device is available.", flush=True)
+        print("[MultiGPU] --multi-gpu was set but only one CUDA device is available.", flush=True)
     if use_data_parallel:
-        print(
-            f"[MultiGPU] DataParallel enabled across {gpu_count} GPUs.", flush=True)
+        print(f"[MultiGPU] DataParallel enabled across {gpu_count} GPUs.", flush=True)
+        model = torch.nn.DataParallel(model)
 
-    mlm_dataset = PairTextDataset(full_examples)
-    mlm_loader = build_data_loader(
-        mlm_dataset,
-        batch_size=args.mlm_batch_size,
-        shuffle=True,
-        collate=MLMCollator(
-            tokenizer=tokenizer,
-            max_length=args.max_length,
-            mlm_probability=args.mlm_probability,
-        ),
-        args=args,
-        generator=torch.Generator().manual_seed(args.seed),
-    )
-    print(
-        f"[Data] MLM examples={len(mlm_dataset):,} batches={len(mlm_loader):,}",
-        flush=True,
-    )
-
-    mlm_model = BertForMaskedLM(model_config.to_bert_config())
-    if use_data_parallel:
-        mlm_model = torch.nn.DataParallel(mlm_model)
-    mlm_model = run_mlm_pretraining(mlm_model, mlm_loader, args, device)
-    pretrained_encoder_state = {
-        name: tensor.detach().cpu().clone()
-        for name, tensor in unwrap_model(mlm_model).bert.state_dict().items()
-    }
-    del mlm_model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    supervised_train_examples = oversample_examples(
-        train_examples, args.anli_oversample)
-    supervised_train_dataset = NLIDataset(
-        supervised_train_examples, tokenizer, args.max_length)
+    train_dataset = NLIDataset(supervised_train_examples, tokenizer, args.max_length)
     holdout_dataset = NLIDataset(holdout_examples, tokenizer, args.max_length)
 
     train_loader = build_data_loader(
-        supervised_train_dataset,
+        train_dataset,
         batch_size=args.nli_batch_size,
         shuffle=True,
-        collate=collate_fn,
         args=args,
         generator=torch.Generator().manual_seed(args.seed + 1),
     )
@@ -903,92 +487,38 @@ def main():
         holdout_dataset,
         batch_size=args.nli_batch_size,
         shuffle=False,
-        collate=collate_fn,
         args=args,
     )
     print(
-        f"[Data] holdout-train examples={len(supervised_train_dataset):,} "
-        f"batches={len(train_loader):,} holdout examples={len(holdout_dataset):,} "
-        f"batches={len(holdout_loader):,}",
+        f"[Data] train examples={len(train_dataset):,} batches={len(train_loader):,} "
+        f"holdout examples={len(holdout_dataset):,} batches={len(holdout_loader):,}",
         flush=True,
     )
 
-    holdout_model = NLI(model_config)
-    if use_data_parallel:
-        holdout_model = torch.nn.DataParallel(holdout_model)
-    load_encoder_state(unwrap_model(holdout_model).bert,
-                       pretrained_encoder_state)
-    holdout_result = run_supervised_training(
-        model=holdout_model,
+    result = run_supervised_training(
+        model=model,
         train_loader=train_loader,
         eval_loader=holdout_loader,
         args=args,
         device=device,
-        save_prefix="holdout",
     )
-
-    best_step = holdout_result["best_step"]
-    best_metrics = holdout_result["best_metrics"] or {}
-    print(f"Best holdout step budget: {best_step}")
-    del holdout_model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    full_supervised_examples = oversample_examples(
-        full_examples, args.anli_oversample)
-    final_train_dataset = NLIDataset(
-        full_supervised_examples, tokenizer, args.max_length)
-    final_train_loader = build_data_loader(
-        final_train_dataset,
-        batch_size=args.nli_batch_size,
-        shuffle=True,
-        collate=collate_fn,
-        args=args,
-        generator=torch.Generator().manual_seed(args.seed + 2),
-    )
-    print(
-        f"[Data] final-train examples={len(final_train_dataset):,} batches={len(final_train_loader):,}",
-        flush=True,
-    )
-
-    final_model = NLI(model_config)
-    if use_data_parallel:
-        final_model = torch.nn.DataParallel(final_model)
-    load_encoder_state(unwrap_model(final_model).bert,
-                       pretrained_encoder_state)
-    final_result = run_supervised_training(
-        model=final_model,
-        train_loader=final_train_loader,
-        eval_loader=None,
-        args=args,
-        device=device,
-        max_train_steps=best_step,
-        save_prefix=None,
-    )
-
-    final_result["ema"].apply_shadow(final_model)
-    try:
-        unwrap_model(final_model).save_pretrained(args.model_dir)
-    finally:
-        final_result["ema"].restore(final_model)
 
     summary = {
         "artifact_version": ARTIFACT_VERSION,
+        "model_name": args.model_name,
         "train_files": used_files,
         "holdout_output": args.holdout_output,
         "num_full_examples": len(full_examples),
-        "num_train_examples": len(train_examples),
+        "num_train_examples": len(supervised_train_examples),
         "num_holdout_examples": len(holdout_examples),
         "source_distribution": Counter(example["source"] for example in full_examples),
         "label_distribution": Counter(str(example["label"]) for example in full_examples),
-        "tokenizer_vocab_size": len(tokenizer),
-        "estimated_parameters": estimated_params,
-        "best_step": best_step,
-        "best_holdout_metrics": best_metrics,
-        "config": model_config.to_dict(),
+        "max_length": args.max_length,
+        "model_parameters": estimated_params,
+        "best_step": result["best_step"],
+        "best_holdout_metrics": result["best_metrics"] or {},
     }
-    save_training_summary(Path(args.model_dir) /
-                          "training_summary.json", summary)
+    save_training_summary(Path(args.model_dir) / "training_summary.json", summary)
 
     print("Training completed.")
     print(json.dumps(summary, indent=2, default=dict))
