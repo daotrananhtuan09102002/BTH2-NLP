@@ -4,3 +4,4 @@ torch==2.2.2
 transformers==4.57.3
 datasets
 tqdm
+evaluate
