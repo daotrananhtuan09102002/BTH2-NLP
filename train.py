@@ -32,6 +32,9 @@ def parse_args():
     parser.add_argument("--map-batch-size", type=int, default=1000)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--pad-to-max-length", action="store_true")
+    parser.add_argument("--max-steps", type=int, default=-1)
+    parser.add_argument("--no-eval", action="store_true")
+    parser.add_argument("--no-save", action="store_true")
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--train-head-only", action="store_true")
     return parser.parse_args()
@@ -89,6 +92,9 @@ def main():
     map_batch_size = args_in.map_batch_size
     num_workers = args_in.num_workers
     pad_to_max_length = args_in.pad_to_max_length
+    max_steps = args_in.max_steps
+    no_eval = args_in.no_eval
+    no_save = args_in.no_save
 
     if args_in.quick:
         # Quick mode for sanity checks and faster iteration.
@@ -185,14 +191,20 @@ def main():
         return_tensors="pt",
     )
 
+    eval_strategy = "no" if no_eval else "epoch"
+    save_strategy = "no" if no_save else "epoch"
+    load_best_model = (not no_eval) and (not no_save)
+    metric_for_best_model = "f1" if load_best_model else None
+    greater_is_better = True if load_best_model else None
+
     args = TrainingArguments(
         output_dir="./NLIMODEL",
         overwrite_output_dir=True,
         do_train=True,
-        do_eval=True,
-        load_best_model_at_end=True,
-        metric_for_best_model="f1",
-        greater_is_better=True,
+        do_eval=not no_eval,
+        load_best_model_at_end=load_best_model,
+        metric_for_best_model=metric_for_best_model,
+        greater_is_better=greater_is_better,
         save_total_limit=1,
         dataloader_pin_memory=True,
         dataloader_num_workers=num_workers,
@@ -202,8 +214,9 @@ def main():
         learning_rate=learning_rate,
         weight_decay=weight_decay,
         num_train_epochs=epochs,
-        eval_strategy="epoch",
-        save_strategy="epoch",
+        max_steps=max_steps,
+        eval_strategy=eval_strategy,
+        save_strategy=save_strategy,
         logging_strategy="steps",
         logging_steps=logging_steps,
         disable_tqdm=False,
@@ -221,7 +234,7 @@ def main():
         train_dataset=train_set,
         eval_dataset=val_set,
         data_collator=data_collator,
-        compute_metrics=compute_metrics,
+        compute_metrics=compute_metrics if not no_eval else None,
     )
 
     trainer.train()
