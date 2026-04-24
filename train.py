@@ -127,12 +127,16 @@ def main():
             max_length=max_length,
             padding="max_length" if pad_to_max_length else False,
         )
-        return {
+        processed = {
             "input_ids": encoded["input_ids"],
             "attention_mask": encoded["attention_mask"],
-            "token_type_ids": encoded.get("token_type_ids"),
             "labels": batch["label"],
+            "length": [len(ids) for ids in encoded["input_ids"]],
         }
+        token_type_ids = encoded.get("token_type_ids")
+        if token_type_ids is not None:
+            processed["token_type_ids"] = token_type_ids
+        return processed
 
     train_set = train_ds.map(
         preprocess,
@@ -206,7 +210,7 @@ def main():
         fp16=use_fp16,
         bf16=use_bf16,
         group_by_length=not pad_to_max_length,
-        length_column_name="input_ids",
+        length_column_name="length",
         optim="adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch",
         report_to=[],
     )
