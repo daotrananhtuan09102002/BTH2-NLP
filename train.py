@@ -4,9 +4,9 @@ import torch
 import argparse
 from datasets import load_dataset
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer, Trainer, TrainingArguments
+from transformers import AutoTokenizer, DataCollatorWithPadding, Trainer, TrainingArguments
 
-from model import NLI, collate_fn
+from model import NLI
 
 
 MODEL_NAME = "albert-large-v2"
@@ -30,6 +30,8 @@ def parse_args():
     parser.add_argument("--train-samples", type=int, default=0)
     parser.add_argument("--val-samples", type=int, default=0)
     parser.add_argument("--map-batch-size", type=int, default=1000)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--pad-to-max-length", action="store_true")
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--train-head-only", action="store_true")
     return parser.parse_args()
@@ -85,6 +87,8 @@ def main():
     train_samples = args_in.train_samples
     val_samples = args_in.val_samples
     map_batch_size = args_in.map_batch_size
+    num_workers = args_in.num_workers
+    pad_to_max_length = args_in.pad_to_max_length
 
     if args_in.quick:
         # Quick mode for sanity checks and faster iteration.
@@ -121,13 +125,13 @@ def main():
             text_pair=batch["hypothesis"],
             truncation="longest_first",
             max_length=max_length,
-            padding="max_length",
+            padding="max_length" if pad_to_max_length else False,
         )
         return {
             "input_ids": encoded["input_ids"],
+            "attention_mask": encoded["attention_mask"],
+            "token_type_ids": encoded.get("token_type_ids"),
             "labels": batch["label"],
-            "pad_token_id": [tokenizer.pad_token_id] * len(batch["label"]),
-            "sep_token_id": [tokenizer.sep_token_id] * len(batch["label"]),
         }
 
     train_set = train_ds.map(
@@ -149,6 +153,11 @@ def main():
         model_name, num_labels=3, classifier_dropout=0.1)
     model.config.use_cache = False
 
+    if torch.cuda.is_available():
+        # TensorFloat-32 helps throughput on Ampere+ GPUs with minimal accuracy impact.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
     if args_in.train_head_only:
         for parameter in model.albert.parameters():
             parameter.requires_grad = False
@@ -162,6 +171,16 @@ def main():
     trainparams = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print("All Param:", allparams, "Train Params:", trainparams)
 
+    use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    use_fp16 = torch.cuda.is_available() and not use_bf16
+
+    data_collator = DataCollatorWithPadding(
+        tokenizer=tokenizer,
+        padding="max_length" if pad_to_max_length else "longest",
+        max_length=max_length if pad_to_max_length else None,
+        return_tensors="pt",
+    )
+
     args = TrainingArguments(
         output_dir="./NLIMODEL",
         overwrite_output_dir=True,
@@ -172,6 +191,7 @@ def main():
         greater_is_better=True,
         save_total_limit=1,
         dataloader_pin_memory=True,
+        dataloader_num_workers=num_workers,
         per_device_train_batch_size=train_batch_size,
         per_device_eval_batch_size=eval_batch_size,
         gradient_accumulation_steps=grad_accum,
@@ -183,7 +203,11 @@ def main():
         logging_strategy="steps",
         logging_steps=logging_steps,
         disable_tqdm=False,
-        fp16=torch.cuda.is_available(),
+        fp16=use_fp16,
+        bf16=use_bf16,
+        group_by_length=not pad_to_max_length,
+        length_column_name="input_ids",
+        optim="adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch",
         report_to=[],
     )
 
@@ -192,7 +216,7 @@ def main():
         args=args,
         train_dataset=train_set,
         eval_dataset=val_set,
-        data_collator=collate_fn,
+        data_collator=data_collator,
         compute_metrics=compute_metrics,
     )
 
